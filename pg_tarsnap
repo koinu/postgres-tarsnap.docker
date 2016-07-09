@@ -1,0 +1,411 @@
+#!/usr/bin/env python2.7
+
+"""pg_tarsnap: A wrapper around tarsnap, pg_dump and pg_restore."""
+
+# Aside: This is only written in Python 2 because that's what's
+# already installed in the official 'postgres' Docker image.
+
+__license__ = "CC0"
+
+import datetime
+import errno
+import os
+import os.path
+import subprocess
+import sys
+
+CACHE_DIR = '/tarsnap/cache'
+KEY_FILE = '/tarsnap/tarsnap.key'
+
+TARSNAP_ENV = {
+    'LANG': 'C.UTF-8',
+}
+
+HELP_NO_VOLUME = '''ERROR: Missing /tarsnap volume
+
+This container requires a persistent data volume at /tarsnap to store
+the tarsnap key cache.
+
+To create a suitable container, run:
+
+    sudo docker create \\
+        --name postgres-tarsnap-data \\
+        --volume /tarsnap \\
+        tianon/true
+
+Next, install the tarsnap key in the data container:
+
+    sudo docker run -it --rm \\
+        --volumes-from postgres-tarsnap-data \\
+        koinu/postgres-tarsnap install-key
+
+Paste your tarsnap key into the standard input of that ephemeral
+container, then close stdin with Ctrl-D. After writing the key to the
+correct location, it will run a fsck to populate the cache.'''
+
+HELP_NO_KEY = '''ERROR: Missing /tarsnap/tarsnap.key
+
+This container requires the tarsnap key be installed in the persistent
+data container.
+
+To install a tarsnap key in the data container, run:
+
+    sudo docker run -it --rm \\
+        --volumes-from postgres-tarsnap-data \\
+        koinu/postgres-tarsnap install-key
+
+Paste your tarsnap key into the standard input of that ephemeral
+container, then close stdin with Ctrl-D. After writing the key to the
+correct location, it will run a fsck to populate the cache.'''
+
+HELP_NO_CACHE = '''ERROR: Missing or empty /tarsnap/cache
+
+To fix this, run a tarsnap fsck:
+
+    sudo docker run --rm \\
+        --volumes-from postgres-tarsnap-data \\
+        koinu/postgres-tarsnap fsck
+'''
+
+HELP_UNKNOWN_COMMAND_TEMPLATE = '''ERROR: Unknown command '%s'
+
+Supported commands:
+
+*   backup (default)
+*   fsck
+*   install-key
+*   restore [name]
+*   list-backups
+*   nuke
+'''
+
+HELP_NO_KEY_INPUT = '''ERROR: No input for install-key
+
+Usage:
+
+    sudo docker run -it --rm \\
+        --volumes-from postgres-tarsnap-data \\
+        koinu/postgres-tarsnap install-key
+
+Paste your tarsnap key into the standard input of that ephemeral
+container, then close stdin with Ctrl-D. After writing the key to the
+correct location, it will run a fsck to populate the cache.'''
+
+HELP_INVALID_KEY_INPUT = '''ERROR: Invalid input for install-key
+
+Expected the input to look like this:
+
+    # START OF TARSNAP KEY FILE
+    ...
+    # END OF TARSNAP KEY FILE
+
+Usage:
+
+    sudo docker run -it --rm \\
+        --volumes-from postgres-tarsnap-data \\
+        koinu/postgres-tarsnap install-key
+
+Paste your tarsnap key into the standard input of that ephemeral
+container, then close stdin with Ctrl-D. After writing the key to the
+correct location, it will run a fsck to populate the cache.'''
+
+HELP_NO_POSTGRES_LINK = '''ERROR: No linked 'postgres' container
+
+Usage:
+
+    sudo docker run --rm \\
+        --volumes-from postgres-tarsnap-data \\
+        --link your-postgres-container-name:postgres \\
+        koinu/postgres-tarsnap [command]
+'''
+
+
+def check_tarsnap_volume(require_key, require_cache):
+    """Check that the tarsnap data volume is mounted and populated."""
+    contents = []
+    try:
+        contents = os.listdir("/tarsnap")
+    except OSError as err:
+        if err.errno != errno.ENOENT:
+            raise
+        sys.exit(HELP_NO_VOLUME)
+    if require_key and 'tarsnap.key' not in contents:
+        sys.exit(HELP_NO_KEY)
+    if require_cache:
+        if 'cache' not in contents or not \
+                os.listdir('/tarsnap/cache'):
+            sys.exit(HELP_NO_CACHE)
+
+
+def prepare_pg_environment():
+    """Set up for pg_* then return the environment map for Popen."""
+    host = os.environ.get('POSTGRES_PORT_5432_TCP_ADDR')
+    port = os.environ.get('POSTGRES_PORT_5432_TCP_PORT')
+    if not host or not port:
+        sys.exit(HELP_NO_POSTGRES_LINK)
+    user = os.environ.get('POSTGRES_ENV_POSTGRES_USER', 'postgres')
+    database = os.environ.get('POSTGRES_ENV_POSTGRES_DB', user)
+    prepare_pgpass(host, port, user, database)
+    return {
+        "PGHOST": host,
+        "PGPORT": port,
+        "PGUSER": user,
+        "PGDATABASE": database,
+        "PGCLIENTENCODING": "UTF8",
+        "LANG": "C.UTF-8",
+    }
+
+
+def prepare_pgpass(host, port, user, database):
+    """Write and secure ~/.pgpass if necessary."""
+    password = os.environ.get('POSTGRES_ENV_POSTGRES_PASSWORD')
+    if password:
+        path = os.path.expanduser('~/.pgpass')
+        with open(path, 'w') as pgpass:
+            pgpass.write('{}:{}:{}:{}:{}\n'.format(
+                host, port, database, user, password))
+        os.chmod(path, 0o600)
+
+
+def get_archive_name(database_name):
+    """Return the formatted name of the archive to create."""
+    now = datetime.datetime.utcnow()
+    return '%s_%s' % (
+        database_name,
+        now.strftime('%Y-%m-%d_%H-%M-%S')
+    )
+
+
+def backup():
+    """Dump the database and back it up to tarsnap."""
+    dump_env = prepare_pg_environment()
+    database_name = dump_env['PGDATABASE']
+    archive_name = get_archive_name(database_name)
+
+    print "Creating archive: %s" % archive_name
+    sys.stdout.flush()
+
+    pg_dump = subprocess.Popen(
+        ['pg_dump',
+         '--format=tar',
+         '--compress=0',
+         database_name],
+        stdout=subprocess.PIPE,
+        stderr=sys.stderr,
+        env=dump_env)
+
+    tarsnap = subprocess.Popen(
+        ['/usr/local/bin/tarsnap',
+         '--no-default-config',
+         '--cachedir',
+         CACHE_DIR,
+         '--keyfile',
+         KEY_FILE,
+         '-c',
+         '--print-stats',
+         '-f',
+         archive_name,
+         '@-'],
+        stdin=pg_dump.stdout,
+        stdout=sys.stdout,
+        stderr=sys.stderr,
+        env=TARSNAP_ENV)
+
+    # FUTURE TODO: Use process groups and clean up straggler processes
+    # in the event of an error.
+
+    tarsnap_return = tarsnap.wait()
+    if tarsnap_return != 0:
+        sys.exit(
+            'ERROR: tarsnap exited with non-zero status %d' %
+            tarsnap_return)
+
+    pg_dump_return = pg_dump.wait()
+    if pg_dump_return != 0:
+        sys.exit(
+            'ERROR: pg_dump exited with non-zero status %d' %
+            pg_dump_return)
+
+
+def list_backups(database_name):
+    """Get archive names of backups of the specific database name."""
+    tarsnap = subprocess.Popen(
+        ['/usr/local/bin/tarsnap',
+         '--no-default-config',
+         '--cachedir',
+         CACHE_DIR,
+         '--keyfile',
+         KEY_FILE,
+         '--list-archives'],
+        stdout=subprocess.PIPE,
+        stderr=sys.stderr,
+        env=TARSNAP_ENV)
+
+    prefix = "%s_" % database_name
+
+    (stdoutdata, _) = tarsnap.communicate()
+    return [archive_name.strip()[len(prefix):]
+            for archive_name
+            in stdoutdata.split("\n")
+            if archive_name.strip().startswith(prefix)]
+
+
+def restore_backup(backup_name):
+    """Restore a specified backup, defaulting to the latest if None."""
+    restore_env = prepare_pg_environment()
+    database_name = restore_env['PGDATABASE']
+    backup_names = list_backups(database_name)
+    if backup_name:
+        if backup_name not in backup_names:
+            sys.exit("ERROR: Backup %s does not exist" % backup_name)
+    else:
+        backup_names.sort()
+        backup_name = backup_names[-1]
+
+    archive_name = "%s_%s" % (database_name, backup_name)
+    print "Restoring archive: %s" % archive_name
+    sys.stdout.flush()
+
+    tarsnap = subprocess.Popen(
+        ['/usr/local/bin/tarsnap',
+         '--no-default-config',
+         '--cachedir',
+         CACHE_DIR,
+         '--keyfile',
+         KEY_FILE,
+         '-r',
+         '-f',
+         archive_name],
+        stdout=subprocess.PIPE,
+        stderr=sys.stderr,
+        env=TARSNAP_ENV)
+
+    pg_restore = subprocess.Popen(
+        ['pg_restore',
+         '--clean',
+         '--if-exists',
+         '--format=tar',
+         '--no-password',
+         '--verbose',
+         '-d',
+         database_name],
+        stdin=tarsnap.stdout,
+        stdout=sys.stdout,
+        stderr=sys.stderr,
+        env=restore_env)
+
+    # FUTURE TODO: Use process groups and clean up straggler processes
+    # in the event of an error.
+
+    pg_restore_return = pg_restore.wait()
+    if pg_restore_return != 0:
+        sys.exit(
+            'ERROR: pg_restore exited with non-zero status %d' %
+            pg_restore_return)
+
+    tarsnap_return = tarsnap.wait()
+    if tarsnap_return != 0:
+        sys.exit(
+            'ERROR: tarsnap exited with non-zero status %d' %
+            tarsnap_return)
+
+
+def fsck():
+    """Run tarsnap --fsck to (re-)populate the cache."""
+    tarsnap = subprocess.Popen(
+        ['/usr/local/bin/tarsnap',
+         '--no-default-config',
+         '--cachedir',
+         CACHE_DIR,
+         '--keyfile',
+         KEY_FILE,
+         '--fsck'],
+        stdout=sys.stdout,
+        stderr=sys.stderr,
+        env=TARSNAP_ENV)
+    tarsnap_return = tarsnap.wait()
+    if tarsnap_return != 0:
+        sys.exit('ERROR: tarsnap exited with non-zero status %d' %
+                 tarsnap_return)
+
+
+def install_key(reader):
+    """Read a tarsnap key from reader and write it to the volume."""
+    lines = reader.readlines()
+    if not lines:
+        sys.exit(HELP_NO_KEY_INPUT)
+    # Drop any blank lines at the beginning or end.
+    while lines and not lines[0].strip():
+        del lines[0]
+    while lines and not lines[-1].strip():
+        del lines[-1]
+    # Make sure this looks like a tarsnap key file.
+    if lines[0].strip() != '# START OF TARSNAP KEY FILE' \
+            or lines[-1].strip() != '# END OF TARSNAP KEY FILE':
+        sys.exit(HELP_INVALID_KEY_INPUT)
+    # Ensure first and last lines both ahve correct newline.
+    lines[0] = '# START OF TARSNAP KEY FILE\n'
+    lines[-1] = '# END OF TARSNAP KEY FILE\n'
+    with open(KEY_FILE, 'w') as output:
+        for line in lines:
+            output.write(line)
+    os.chmod(KEY_FILE, 0o600)
+
+
+def nuke():
+    """Run tarsnap --nuke. Requires a tty for the user to confirm."""
+    tarsnap = subprocess.Popen(
+        ['/usr/local/bin/tarsnap',
+         '--no-default-config',
+         '--cachedir',
+         CACHE_DIR,
+         '--keyfile',
+         KEY_FILE,
+         '--nuke'],
+        stdin=sys.stdin,
+        stdout=sys.stdout,
+        stderr=sys.stderr,
+        env=TARSNAP_ENV)
+    tarsnap_return = tarsnap.wait()
+    if tarsnap_return != 0:
+        sys.exit('ERROR: tarsnap exited with non-zero status %d' %
+                 tarsnap_return)
+
+
+def main(arguments):
+    """Execute the command selected by the first argument."""
+    command = 'backup'
+    if arguments:
+        command = arguments[0]
+
+    if command == 'backup':
+        check_tarsnap_volume(True, True)
+        backup()
+    elif command == 'fsck':
+        check_tarsnap_volume(True, False)
+        fsck()
+    elif command == 'install-key':
+        check_tarsnap_volume(False, False)
+        install_key(sys.stdin)
+        print "Key installed. Beginning tarsnap --fsck."
+        fsck()
+    elif command == 'list-backups':
+        check_tarsnap_volume(True, True)
+        env = prepare_pg_environment()
+        for backup_name in list_backups(env['PGDATABASE']):
+            print backup_name
+    elif command == 'restore':
+        check_tarsnap_volume(True, True)
+        name = None
+        if len(arguments) > 1:
+            name = arguments[1]
+        restore_backup(name)
+    elif command == 'nuke':
+        check_tarsnap_volume(True, True)
+        nuke()
+        fsck()  # Running nuke makes the cache invalid.
+    else:
+        sys.exit(HELP_UNKNOWN_COMMAND_TEMPLATE % command)
+
+if __name__ == '__main__':
+    main(sys.argv[1:])
